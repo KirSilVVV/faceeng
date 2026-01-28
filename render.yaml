@@ -1,0 +1,14 @@
+services:
+  - type: worker
+    name: facecheck-telegram-bot
+    env: docker
+    plan: starter
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: FACECHECK_API_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
