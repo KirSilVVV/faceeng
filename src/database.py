@@ -225,3 +225,129 @@ async def record_payment(
         logger.info(f"Payment recorded: {telegram_id} paid {stars_amount} stars for {searches_amount} searches")
         return True
     return False
+
+
+# ============ ANALYTICS ============
+
+async def track_event(
+    telegram_id: int,
+    event_type: str,
+    metadata: dict = None
+) -> bool:
+    """
+    Track user event for analytics.
+    Event types: bot_start, photo_sent, payment_clicked, payment_completed, unlock_clicked, search_completed
+    """
+    client = get_client()
+
+    record = {
+        "telegram_id": telegram_id,
+        "event_type": event_type,
+        "metadata": metadata or {}
+    }
+
+    result = await client.insert("events", record)
+    if result:
+        logger.debug(f"Event tracked: {telegram_id} - {event_type}")
+        return True
+    return False
+
+
+async def get_stats() -> dict:
+    """Get bot statistics for admin."""
+    client = get_client()
+
+    # Total users
+    users = await client.select("users", columns="telegram_id")
+    total_users = len(users)
+
+    # Users with payments
+    payments = await client.select("payments", columns="telegram_id")
+    paying_users = len(set(p["telegram_id"] for p in payments))
+
+    # Total revenue
+    all_payments = await client.select("payments", columns="stars_amount")
+    total_stars = sum(p["stars_amount"] for p in all_payments)
+
+    # Events stats
+    events = await client.select("events", columns="event_type")
+    event_counts = {}
+    for e in events:
+        et = e["event_type"]
+        event_counts[et] = event_counts.get(et, 0) + 1
+
+    return {
+        "total_users": total_users,
+        "paying_users": paying_users,
+        "conversion_rate": round(paying_users / total_users * 100, 1) if total_users > 0 else 0,
+        "total_stars": total_stars,
+        "events": event_counts
+    }
+
+
+# ============ DAILY FREE SEARCH ============
+
+async def check_and_grant_daily_free_search(telegram_id: int) -> bool:
+    """
+    Check if user is eligible for daily free search.
+    If last_free_grant was > 24h ago, grant 1 free search.
+    Returns True if free search was granted.
+    """
+    client = get_client()
+
+    result = await client.select("users", {"telegram_id": telegram_id}, "free_searches,last_free_grant")
+    if not result:
+        return False
+
+    user = result[0]
+    last_grant = user.get("last_free_grant")
+
+    # Check if 24 hours passed since last grant
+    should_grant = False
+
+    if last_grant is None:
+        # Never granted before (old user) - don't auto-grant, they got initial free search
+        should_grant = False
+    else:
+        # Parse timestamp and check if 24h passed
+        try:
+            from datetime import datetime, timedelta, timezone
+            if isinstance(last_grant, str):
+                # Parse ISO format
+                last_grant_dt = datetime.fromisoformat(last_grant.replace('Z', '+00:00'))
+            else:
+                last_grant_dt = last_grant
+
+            now = datetime.now(timezone.utc)
+            if now - last_grant_dt > timedelta(hours=24):
+                should_grant = True
+        except Exception as e:
+            logger.error(f"Error parsing last_free_grant: {e}")
+            should_grant = False
+
+    if should_grant and user["free_searches"] == 0:
+        # Grant daily free search
+        await client.update(
+            "users",
+            {"telegram_id": telegram_id},
+            {
+                "free_searches": 1,
+                "last_free_grant": datetime.now(timezone.utc).isoformat()
+            }
+        )
+        logger.info(f"Daily free search granted to {telegram_id}")
+        return True
+
+    return False
+
+
+async def mark_free_search_granted(telegram_id: int) -> bool:
+    """Mark when user received their free search (for new users)."""
+    client = get_client()
+    from datetime import datetime, timezone
+
+    return await client.update(
+        "users",
+        {"telegram_id": telegram_id},
+        {"last_free_grant": datetime.now(timezone.utc).isoformat()}
+    )

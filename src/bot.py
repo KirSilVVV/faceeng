@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import logging
 import time
@@ -61,7 +62,7 @@ async def check_api_balance_and_alert(bot: Bot):
     except Exception as e:
         logger.error(f"Balance check error: {e}")
 
-# Store pending search results temporarily (search_id -> {result, created_at})
+# Store pending search results temporarily (search_id -> {result, created_at, user_id, unlocked})
 pending_results: dict[str, dict] = {}
 
 # Store pending photos for paid search (user_id -> image_bytes)
@@ -70,11 +71,47 @@ pending_photos: dict[int, bytes] = {}
 # Store last search_id for each user (for /debug command)
 last_search_by_user: dict[int, str] = {}
 
+# Store pending reminder tasks (search_id -> asyncio.Task)
+pending_reminders: dict[str, asyncio.Task] = {}
+
 # Results expiration time in seconds
 RESULTS_EXPIRATION_SECONDS = 30 * 60  # 30 minutes
 
+# Reminder time (5 minutes before expiration)
+REMINDER_DELAY_SECONDS = 25 * 60  # 25 minutes
+
 # Free search shows only 3 results (paid shows 10)
 FREE_RESULTS_COUNT = 3
+
+
+async def schedule_expiry_reminder(bot: Bot, user_id: int, search_id: str):
+    """Schedule a reminder 5 minutes before results expire."""
+    try:
+        await asyncio.sleep(REMINDER_DELAY_SECONDS)
+
+        # Check if results still exist and not unlocked
+        if search_id in pending_results:
+            result = pending_results[search_id]
+            if not result.get("_unlocked", False):
+                # Send reminder
+                try:
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text="⏰ <b>5 minutes left!</b>\n\n"
+                             "Your search results will expire soon.\n"
+                             f"Unlock all for just <b>{UNLOCK_ALL_STARS} ⭐</b>",
+                        reply_markup=get_unlock_all_keyboard(search_id)
+                    )
+                    logger.info(f"Reminder sent to {user_id} for search {search_id}")
+                except Exception as e:
+                    logger.error(f"Failed to send reminder: {e}")
+
+    except asyncio.CancelledError:
+        pass
+    finally:
+        # Cleanup
+        if search_id in pending_reminders:
+            del pending_reminders[search_id]
 
 
 def mask_name(name: str) -> str:
@@ -226,7 +263,19 @@ async def cmd_start(message: Message):
         message.from_user.id,
         message.from_user.username
     )
-    await message.answer(WELCOME_MESSAGE)
+
+    # Track event
+    await db.track_event(message.from_user.id, "bot_start")
+
+    # Check for daily free search
+    granted = await db.check_and_grant_daily_free_search(message.from_user.id)
+    if granted:
+        await message.answer(
+            "🎁 <b>Daily bonus!</b>\n"
+            "You got 1 free search today!\n\n" + WELCOME_MESSAGE
+        )
+    else:
+        await message.answer(WELCOME_MESSAGE)
 
 
 @router.message(Command("info"))
@@ -349,9 +398,33 @@ async def cmd_debug(message: Message):
             await message.answer("\n".join(chunk_lines), link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    """Show bot statistics - ADMIN ONLY."""
+    if str(message.from_user.id) != ADMIN_CHAT_ID:
+        await message.answer("This command is not available.")
+        return
+
+    stats = await db.get_stats()
+
+    events_text = "\n".join([
+        f"  • {k}: {v}" for k, v in stats.get("events", {}).items()
+    ]) or "  No events yet"
+
+    await message.answer(
+        f"<b>📊 Bot Statistics</b>\n\n"
+        f"👥 Total users: <b>{stats['total_users']}</b>\n"
+        f"💰 Paying users: <b>{stats['paying_users']}</b>\n"
+        f"📈 Conversion: <b>{stats['conversion_rate']}%</b>\n"
+        f"⭐ Total revenue: <b>{stats['total_stars']} stars</b>\n\n"
+        f"<b>Events:</b>\n{events_text}"
+    )
+
+
 @router.callback_query(F.data == "paid_search")
 async def handle_paid_search_request(callback: CallbackQuery, bot: Bot):
     """User wants to do a paid search - send invoice."""
+    await db.track_event(callback.from_user.id, "payment_clicked", {"type": "paid_search"})
     await bot.send_invoice(
         chat_id=callback.from_user.id,
         title="Face Search",
@@ -366,6 +439,7 @@ async def handle_paid_search_request(callback: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == "buy_1_search")
 async def handle_buy_1_search(callback: CallbackQuery, bot: Bot):
     """Buy 1 search credit."""
+    await db.track_event(callback.from_user.id, "payment_clicked", {"type": "buy_1_search"})
     await bot.send_invoice(
         chat_id=callback.from_user.id,
         title="1 Search",
@@ -380,6 +454,7 @@ async def handle_buy_1_search(callback: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == "buy_5_searches")
 async def handle_buy_5_searches(callback: CallbackQuery, bot: Bot):
     """Buy 5 searches pack."""
+    await db.track_event(callback.from_user.id, "payment_clicked", {"type": "buy_5_searches"})
     await bot.send_invoice(
         chat_id=callback.from_user.id,
         title="5 Searches Pack",
@@ -395,6 +470,7 @@ async def handle_buy_5_searches(callback: CallbackQuery, bot: Bot):
 async def handle_unlock_all(callback: CallbackQuery, bot: Bot):
     """Unlock all 10 results at once."""
     search_id = callback.data.replace("unlock_all_", "")
+    await db.track_event(callback.from_user.id, "unlock_clicked", {"type": "unlock_all", "search_id": search_id})
     await bot.send_invoice(
         chat_id=callback.from_user.id,
         title="Unlock all 10",
@@ -415,6 +491,8 @@ async def handle_unlock(callback: CallbackQuery, bot: Bot):
     parts = callback.data.split("_")
     search_id = parts[1]
     result_index = int(parts[2])
+
+    await db.track_event(callback.from_user.id, "unlock_clicked", {"type": "unlock_single", "search_id": search_id})
 
     # Send invoice for unlocking the link
     await bot.send_invoice(
@@ -439,6 +517,9 @@ async def handle_successful_payment(message: Message, bot: Bot):
     payment_id = message.successful_payment.telegram_payment_charge_id
     stars = message.successful_payment.total_amount
     user_id = message.from_user.id
+
+    # Track payment completed event
+    await db.track_event(user_id, "payment_completed", {"type": payload, "stars": stars})
 
     if payload == "paid_search":
         # User paid for a search - now execute it
@@ -474,8 +555,14 @@ async def handle_successful_payment(message: Message, bot: Bot):
     elif payload.startswith("unlock_all_"):
         search_id = payload.replace("unlock_all_", "")
 
+        # Cancel reminder for this search
+        if search_id in pending_reminders:
+            pending_reminders[search_id].cancel()
+            del pending_reminders[search_id]
+
         if search_id in pending_results and not is_result_expired(search_id):
             results = pending_results[search_id]
+            results["_unlocked"] = True  # Mark as unlocked
             faces = results.get("output", {}).get("items", [])[:10]
 
             lines = ["🔓 <b>All links unlocked!</b>\n"]
@@ -616,6 +703,9 @@ async def execute_paid_search(message: Message, bot: Bot, image_bytes: bytes):
     names = await extract_names_from_results(faces[:10])
     await send_name_summary(message, names)
 
+    # Track search completed event
+    await db.track_event(message.from_user.id, "search_completed", {"type": "paid", "results": min(len(faces), 10)})
+
     # Check API balance and alert if low
     await check_api_balance_and_alert(bot)
 
@@ -626,6 +716,12 @@ async def handle_photo(message: Message, bot: Bot):
         message.from_user.id,
         message.from_user.username
     )
+
+    # Track event
+    await db.track_event(message.from_user.id, "photo_sent")
+
+    # Check for daily free search
+    await db.check_and_grant_daily_free_search(message.from_user.id)
 
     credits = await db.get_user_credits(message.from_user.id)
     free_searches = credits.get("free_searches", 0)
@@ -761,6 +857,15 @@ async def execute_free_search(message: Message, bot: Bot, image_bytes: bytes):
         f"<i>Don't lose these matches</i>",
         reply_markup=get_unlock_all_keyboard(search_id)
     )
+
+    # Track search completed event
+    await db.track_event(message.from_user.id, "search_completed", {"type": "free", "results": total_results})
+
+    # Schedule reminder 5 minutes before expiration
+    reminder_task = asyncio.create_task(
+        schedule_expiry_reminder(bot, message.from_user.id, search_id)
+    )
+    pending_reminders[search_id] = reminder_task
 
     # Check API balance and alert if low
     await check_api_balance_and_alert(bot)
