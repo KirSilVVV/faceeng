@@ -1,5 +1,6 @@
 import base64
 import logging
+import time
 from io import BytesIO
 
 import httpx
@@ -60,7 +61,7 @@ async def check_api_balance_and_alert(bot: Bot):
     except Exception as e:
         logger.error(f"Balance check error: {e}")
 
-# Store pending search results temporarily (search_id -> results)
+# Store pending search results temporarily (search_id -> {result, created_at})
 pending_results: dict[str, dict] = {}
 
 # Store pending photos for paid search (user_id -> image_bytes)
@@ -69,27 +70,58 @@ pending_photos: dict[int, bytes] = {}
 # Store last search_id for each user (for /debug command)
 last_search_by_user: dict[int, str] = {}
 
-WELCOME_MESSAGE = f"""<b>Face Search Bot</b>
+# Results expiration time in seconds
+RESULTS_EXPIRATION_SECONDS = 30 * 60  # 30 minutes
 
-Send a photo - I'll find profiles online.
+# Free search shows only 3 results (paid shows 10)
+FREE_RESULTS_COUNT = 3
 
-<b>Pricing:</b>
-- First search: <b>FREE</b> (10 results, links hidden)
-- Unlock 1 link: {UNLOCK_SINGLE_STARS}
-- Unlock ALL 10 links: {UNLOCK_ALL_STARS}
-- New search: {SEARCH_COST_STARS} (10 results with links)
-- 5 searches pack: {SEARCH_PACK_5_STARS} (save {SEARCH_COST_STARS * 5 - SEARCH_PACK_5_STARS})
 
-<b>Commands:</b>
-/start - This message
-/buy - Buy searches
-/info - Your credits
+def mask_name(name: str) -> str:
+    """Mask name like 'Anna Kozlova' -> 'An***a Ko***va'"""
+    if not name:
+        return "***"
 
-<b>Important:</b>
-- Bot only works with public sources
-- Results are potential matches, not identity confirmation
-- Use only with consent of the person in the photo
-- Images are not stored after processing"""
+    parts = name.split()
+    masked_parts = []
+
+    for part in parts:
+        if len(part) <= 2:
+            masked_parts.append(part[0] + "***")
+        elif len(part) <= 4:
+            masked_parts.append(part[0] + "***" + part[-1])
+        else:
+            masked_parts.append(part[:2] + "***" + part[-2:])
+
+    return " ".join(masked_parts)
+
+
+def is_result_expired(search_id: str) -> bool:
+    """Check if search result has expired."""
+    if search_id not in pending_results:
+        return True
+
+    result = pending_results[search_id]
+    created_at = result.get("_created_at", 0)
+    return (time.time() - created_at) > RESULTS_EXPIRATION_SECONDS
+
+WELCOME_MESSAGE = f"""<b>🔍 Face Search Bot</b>
+
+Send a photo — I'll find matching profiles online.
+
+<b>💰 Pricing:</b>
+• First search: <b>FREE</b> ({FREE_RESULTS_COUNT} preview results)
+• Unlock all results: <b>{UNLOCK_ALL_STARS} ⭐</b>
+• Full search: <b>{SEARCH_COST_STARS} ⭐</b> (10 results + links)
+• 5 searches: <b>{SEARCH_PACK_5_STARS} ⭐</b> (save {SEARCH_COST_STARS * 5 - SEARCH_PACK_5_STARS} ⭐)
+
+⏰ <i>Results expire in 30 minutes</i>
+
+<b>📋 Commands:</b>
+/buy — Buy searches
+/info — Your credits
+
+<i>Results from public sources. Photos not stored.</i>"""
 
 
 def blur_image(img_bytes: bytes, blur_radius: int = 30) -> bytes:
@@ -162,7 +194,7 @@ def get_search_keyboard() -> InlineKeyboardMarkup:
     """Create keyboard for buying a paid search."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
-            text=f"Search - {SEARCH_COST_STARS}",
+            text=f"🔍 Search — {SEARCH_COST_STARS} ⭐",
             callback_data="paid_search"
         )],
     ])
@@ -172,7 +204,7 @@ def get_unlock_keyboard(search_id: str, result_index: int) -> InlineKeyboardMark
     """Create keyboard to unlock a single result link."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
-            text=f"Unlock - {UNLOCK_SINGLE_STARS}",
+            text=f"🔓 Unlock — {UNLOCK_SINGLE_STARS} ⭐",
             callback_data=f"unlock_{search_id}_{result_index}"
         )],
     ])
@@ -182,7 +214,7 @@ def get_unlock_all_keyboard(search_id: str) -> InlineKeyboardMarkup:
     """Create keyboard to unlock all results at once."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
-            text=f"Unlock ALL 10 - {UNLOCK_ALL_STARS}",
+            text=f"🔓 Unlock ALL 10 — {UNLOCK_ALL_STARS} ⭐",
             callback_data=f"unlock_all_{search_id}"
         )],
     ])
@@ -227,26 +259,31 @@ async def cmd_buy(message: Message):
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
-            text=f"1 search - {SEARCH_COST_STARS}",
+            text=f"🔍 1 search — {SEARCH_COST_STARS} ⭐",
             callback_data="buy_1_search"
         )],
         [InlineKeyboardButton(
-            text=f"5 searches - {SEARCH_PACK_5_STARS} (save {SEARCH_COST_STARS * 5 - SEARCH_PACK_5_STARS})",
+            text=f"🔥 5 searches — {SEARCH_PACK_5_STARS} ⭐ (save {SEARCH_COST_STARS * 5 - SEARCH_PACK_5_STARS} ⭐)",
             callback_data="buy_5_searches"
         )],
     ])
 
     await message.answer(
-        f"<b>Buy searches</b>\n\n"
-        f"Your credits: {free + paid} ({free} free + {paid} paid)\n\n"
-        f"Each search gives 10 results with links.",
+        f"<b>💰 Buy Searches</b>\n\n"
+        f"Your credits: <b>{free + paid}</b>\n\n"
+        f"Each search = 10 results with direct links.",
         reply_markup=keyboard
     )
 
 
 @router.message(Command("reset"))
 async def cmd_reset(message: Message):
-    """Reset user credits for testing."""
+    """Reset user credits - ADMIN ONLY."""
+    # Check if user is admin
+    if str(message.from_user.id) != ADMIN_CHAT_ID:
+        await message.answer("This command is not available.")
+        return
+
     success = await db.reset_user_credits(message.from_user.id)
     if success:
         await message.answer(
@@ -421,8 +458,8 @@ async def handle_successful_payment(message: Message, bot: Bot):
         await db.add_paid_searches(user_id, 1)
         await db.record_payment(user_id, stars, 1, payment_id)
         await message.answer(
-            "<b>1 search added!</b>\n"
-            "Send a photo to start."
+            "✅ <b>1 search added!</b>\n\n"
+            "📸 Send a photo to start searching."
         )
 
     elif payload == "buy_5_searches":
@@ -430,18 +467,18 @@ async def handle_successful_payment(message: Message, bot: Bot):
         await db.add_paid_searches(user_id, 5)
         await db.record_payment(user_id, stars, 5, payment_id)
         await message.answer(
-            "<b>5 searches added!</b>\n"
-            "Send a photo to start."
+            "✅ <b>5 searches added!</b>\n\n"
+            "📸 Send a photo to start searching."
         )
 
     elif payload.startswith("unlock_all_"):
         search_id = payload.replace("unlock_all_", "")
 
-        if search_id in pending_results:
+        if search_id in pending_results and not is_result_expired(search_id):
             results = pending_results[search_id]
             faces = results.get("output", {}).get("items", [])[:10]
 
-            lines = ["<b>All links unlocked</b>\n"]
+            lines = ["🔓 <b>All links unlocked!</b>\n"]
             for i, face in enumerate(faces, 1):
                 score = face.get("score", 0)
                 url = face.get("url", "N/A")
@@ -451,9 +488,22 @@ async def handle_successful_payment(message: Message, bot: Bot):
                 "\n".join(lines),
                 link_preview_options=LinkPreviewOptions(is_disabled=True)
             )
+
+            # Upsell after unlock
+            await message.answer(
+                "🔍 <b>Want to search again?</b>\n"
+                f"Buy more searches for <b>{SEARCH_COST_STARS} ⭐</b> each!",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text=f"🔥 5 searches — {SEARCH_PACK_5_STARS} ⭐",
+                        callback_data="buy_5_searches"
+                    )]
+                ])
+            )
         else:
             await message.answer(
-                "Results expired. Make a new search."
+                "⏰ <b>Results expired!</b>\n\n"
+                "Send a new photo to search again."
             )
 
         await db.record_payment(user_id, stars, 0, payment_id)
@@ -463,7 +513,7 @@ async def handle_successful_payment(message: Message, bot: Bot):
         search_id = parts[1]
         result_index = int(parts[2])
 
-        if search_id in pending_results:
+        if search_id in pending_results and not is_result_expired(search_id):
             results = pending_results[search_id]
             faces = results.get("output", {}).get("items", [])
 
@@ -472,14 +522,15 @@ async def handle_successful_payment(message: Message, bot: Bot):
                 url = face.get("url", "N/A")
 
                 await message.answer(
-                    f"<b>Link unlocked</b>\n\n"
+                    f"🔓 <b>Link unlocked!</b>\n\n"
                     f"Match: {face.get('score', 0)}%\n"
-                    f"{url}",
+                    f"🔗 {url}",
                     link_preview_options=LinkPreviewOptions(is_disabled=True)
                 )
         else:
             await message.answer(
-                "Results expired. Make a new search."
+                "⏰ <b>Results expired!</b>\n\n"
+                "Send a new photo to search again."
             )
 
         await db.record_payment(user_id, stars, 0, payment_id)
@@ -529,8 +580,9 @@ async def execute_paid_search(message: Message, bot: Bot, image_bytes: bytes):
         await status_msg.edit_text(stats + "\n<i>No matches found.</i>")
         return
 
-    # Store search results for /debug command
+    # Store search results with timestamp
     search_id = result.get("id_search") or str(message.message_id)
+    result["_created_at"] = time.time()
     pending_results[search_id] = result
     last_search_by_user[message.from_user.id] = search_id
 
@@ -647,19 +699,28 @@ async def execute_free_search(message: Message, bot: Bot, image_bytes: bytes):
         await status_msg.edit_text(stats + "\n<i>No matches found.</i>")
         return
 
+    # Store search results with timestamp
     search_id = result.get("id_search") or str(message.message_id)
+    result["_created_at"] = time.time()
     pending_results[search_id] = result
     last_search_by_user[message.from_user.id] = search_id
 
+    # Calculate how many more results exist
+    total_results = min(len(faces), 10)
+    hidden_count = total_results - FREE_RESULTS_COUNT
+
     await status_msg.edit_text(
-        stats + f"\n<i>Links hidden. Unlock 1 for {UNLOCK_SINGLE_STARS} or ALL for {UNLOCK_ALL_STARS}</i>"
+        stats +
+        f"\n⏰ <b>Results expire in 30 minutes!</b>\n"
+        f"<i>🔒 Showing {FREE_RESULTS_COUNT} of {total_results} results. "
+        f"Unlock all {total_results} for {UNLOCK_ALL_STARS} ⭐</i>"
     )
 
-    # Free search: show 10 results with hidden links
-    for i, face in enumerate(faces[:10], 1):
+    # Free search: show only FREE_RESULTS_COUNT results
+    for i, face in enumerate(faces[:FREE_RESULTS_COUNT], 1):
         score = face.get("score", 0)
 
-        caption = f"<b>#{i}</b> - Match: {score}%\n<i>Link hidden</i>"
+        caption = f"<b>#{i}</b> — Match: {score}%\n🔒 <i>Link hidden</i>"
 
         img_bytes = await get_image_bytes(face)
         if img_bytes:
@@ -676,15 +737,30 @@ async def execute_free_search(message: Message, bot: Bot, image_bytes: bytes):
         else:
             await message.answer(caption, reply_markup=get_unlock_keyboard(search_id, i - 1))
 
-    # Add "Unlock All" button
+    # Show teaser for hidden results
+    if hidden_count > 0:
+        await message.answer(
+            f"➕ <b>{hidden_count} more results hidden</b>\n"
+            f"<i>Unlock all to see them!</i>"
+        )
+
+    # Extract names and show as teasers
+    names = await extract_names_from_results(faces[:total_results])
+    if names:
+        teaser_lines = ["👤 <b>Names found (masked):</b>\n"]
+        for url, name in list(names.items())[:5]:  # Show max 5 teasers
+            masked = mask_name(name)
+            teaser_lines.append(f"• {masked}")
+        teaser_lines.append(f"\n<i>Unlock to see full names and links!</i>")
+        await message.answer("\n".join(teaser_lines))
+
+    # Add "Unlock All" button with urgency
     await message.answer(
-        f"<b>Tip:</b> Unlock all 10 links at once for {UNLOCK_ALL_STARS} (save {UNLOCK_SINGLE_STARS * 10 - UNLOCK_ALL_STARS})",
+        f"🔥 <b>Unlock all {total_results} results</b> — just <b>{UNLOCK_ALL_STARS} ⭐</b>\n\n"
+        f"⏰ <b>Results expire in 30 min!</b>\n"
+        f"<i>Don't lose these matches</i>",
         reply_markup=get_unlock_all_keyboard(search_id)
     )
-
-    # Extract and show names from VK profiles
-    names = await extract_names_from_results(faces[:10])
-    await send_name_summary(message, names)
 
     # Check API balance and alert if low
     await check_api_balance_and_alert(bot)
@@ -693,7 +769,7 @@ async def execute_free_search(message: Message, bot: Bot, image_bytes: bytes):
 @router.message()
 async def handle_other(message: Message):
     await message.answer(
-        "Please send a photo to search."
+        "📸 Send a photo to search for matching profiles."
     )
 
 
