@@ -157,6 +157,7 @@ Send a photo — I'll find matching profiles online.
 <b>📋 Commands:</b>
 /buy — Buy searches
 /info — Your credits
+/stars — Get Stars cheaper
 
 <i>Results from public sources. Photos not stored.</i>"""
 
@@ -320,8 +321,20 @@ async def cmd_buy(message: Message):
     await message.answer(
         f"<b>💰 Buy Searches</b>\n\n"
         f"Your credits: <b>{free + paid}</b>\n\n"
-        f"Each search = 10 results with direct links.",
+        f"Each search = 10 results with direct links.\n\n"
+        f"<i>💡 Get Stars cheaper at fragment.com</i>",
         reply_markup=keyboard
+    )
+
+
+@router.message(Command("stars"))
+async def cmd_stars(message: Message):
+    """Info about getting Telegram Stars."""
+    await message.answer(
+        "<b>⭐ How to get Telegram Stars</b>\n\n"
+        "1️⃣ <b>In Telegram</b> — tap any payment button\n"
+        "2️⃣ <b>fragment.com</b> — buy cheaper (up to 30% off)\n\n"
+        "<i>Fragment is Telegram's official marketplace</i>"
     )
 
 
